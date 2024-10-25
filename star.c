@@ -232,10 +232,6 @@ void create_star(char *star_filename, int file_count, char *files[])
             printf("  Tamaño: %lld bytes\n", (long long)header.files[header.file_count - 1].size);
             printf("  Bloque inicial: %d\n", header.files[header.file_count - 1].start_block);
         }
-        else if (verbose_level == 1)
-        {
-            printf("Agregado: %s\n", files[i]);
-        }
     }
 
     write_header(fd, &header);
@@ -256,9 +252,10 @@ void extract_star(char *star_filename)
 
     for (int i = 0; i < header.file_count; i++)
     {
+        verbose_print("Extrayendo:", 1);
         if (verbose_level >= 1)
         {
-            printf("Extrayendo: %s\n", header.files[i].filename);
+            printf(" %s\n", header.files[i].filename);
         }
 
         int file_fd = open(header.files[i].filename, O_CREAT | O_WRONLY | O_TRUNC, 0666);
@@ -363,10 +360,10 @@ void delete_star(char *star_filename, int file_count, char *files[])
         {
             remove_file_from_star(fd, &header, files[i]);
 
-            if (verbose_level > 0)
-            {
-                printf("Archivo '%s' eliminado.\n", files[i]);
-            }
+            // Mensaje consolidado de eliminación
+            char message[300];
+            snprintf(message, sizeof(message), "Archivo '%s' eliminado del empaquetado.", files[i]);
+            verbose_print(message, 1);
         }
         else
         {
@@ -646,10 +643,10 @@ void add_file_to_star(int fd, StarHeader *header, char *filename)
 
     close(file_fd);
 
-    if (verbose_level > 0)
-    {
-        printf("Archivo '%s' agregado al empaquetado.\n", filename);
-    }
+    // Consolidación del mensaje verbose
+    char message[300];
+    snprintf(message, sizeof(message), "Archivo '%s' agregado al empaquetado.", filename);
+    verbose_print(message, 1);
 }
 
 void remove_file_from_star(int fd, StarHeader *header, char *filename)
@@ -684,11 +681,6 @@ void remove_file_from_star(int fd, StarHeader *header, char *filename)
         header->files[j] = header->files[j + 1];
     }
     header->file_count--;
-
-    if (verbose_level > 0)
-    {
-        printf("Archivo '%s' eliminado del empaquetado.\n", filename);
-    }
 }
 
 void verbose_print(const char *message, int level)

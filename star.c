@@ -7,10 +7,24 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <getopt.h>
+#include <math.h>
 
 #define BLOCK_SIZE 262144       // Tamaño del bloque: 256K
 #define MAX_FILES 250           // Máximo número de archivos en el archivo
 #define MAX_FILENAME_LENGTH 256 // Longitud máxima para nombres de archivo
+
+// Estructura para análisis de fragmentación
+typedef struct
+{
+    int total_blocks;          // Total de bloques en el archivo
+    int used_blocks;           // Bloques en uso
+    int free_blocks;           // Bloques libres
+    int fragmented_blocks;     // Bloques que causan fragmentación
+    float fragmentation_ratio; // Ratio de fragmentación
+    int largest_free_chunk;    // Mayor número de bloques libres contiguos
+    int smallest_free_chunk;   // Menor número de bloques libres contiguos
+    int *block_status;         // Array para estado de bloques (1=usado, 0=libre)
+} FragmentationInfo;
 
 // Estructura que representa una entrada de archivo en el archivador
 typedef struct
@@ -60,6 +74,8 @@ void write_header(int fd, StarHeader *header);
 void add_file_to_star(int fd, StarHeader *header, char *filename);
 void remove_file_from_star(int fd, StarHeader *header, char *filename);
 void check_file_exists(char *filename);
+FragmentationInfo analyze_fragmentation(int fd, StarHeader *header);
+void print_fragmentation_visualization(FragmentationInfo *info, StarHeader *header);
 
 // Función para comparar dos mapeos de bloques (usada en qsort)
 int compare_blocks(const void *a, const void *b)
@@ -401,7 +417,6 @@ void list_star(char *star_filename)
  */
 void delete_star(char *star_filename, int file_count, char *files[])
 {
-    // Abrir el archivo de archivado para lectura y escritura
     int fd = open(star_filename, O_RDWR);
     if (fd < 0)
     {
@@ -409,22 +424,16 @@ void delete_star(char *star_filename, int file_count, char *files[])
         exit(EXIT_FAILURE);
     }
 
-    // Leer el encabezado del archivador
     StarHeader header;
     read_header(fd, &header);
 
-    // Eliminar cada archivo especificado del archivador
     for (int i = 0; i < file_count; i++)
     {
         int index = find_file_entry(&header, files[i]);
         if (index != -1)
         {
             remove_file_from_star(fd, &header, files[i]);
-
-            // Mensaje consolidado de verbosidad para eliminación
-            char message[300];
-            snprintf(message, sizeof(message), "Archivo '%s' eliminado del empaquetado.", files[i]);
-            verbose_print(message, 1);
+            printf("Archivo '%s' eliminado del empaquetado.\n", files[i]);
         }
         else
         {
@@ -432,8 +441,19 @@ void delete_star(char *star_filename, int file_count, char *files[])
         }
     }
 
-    // Escribir el encabezado actualizado de nuevo en el archivador
+    // Write header before analysis
     write_header(fd, &header);
+
+    // Analyze fragmentation after deletion
+    if (verbose_level >= 1)
+    {
+        FragmentationInfo frag_info = analyze_fragmentation(fd, &header);
+        if (frag_info.block_status != NULL)
+        {
+            print_fragmentation_visualization(&frag_info, &header);
+            free(frag_info.block_status);
+        }
+    }
     close(fd);
 }
 
@@ -521,137 +541,286 @@ void update_star(char *star_filename, int file_count, char *files[])
     close(fd);
 }
 
+FragmentationInfo analyze_fragmentation(int fd, StarHeader *header)
+{
+    FragmentationInfo info;
+    memset(&info, 0, sizeof(FragmentationInfo));
+
+    // Get file size and calculate total blocks
+    off_t file_size = lseek(fd, 0, SEEK_END);
+    info.total_blocks = (file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Allocate block status array
+    info.block_status = calloc(info.total_blocks, sizeof(int));
+    if (!info.block_status)
+    {
+        fprintf(stderr, "Error: No se pudo asignar memoria\n");
+        return info;
+    }
+
+    // Mark header blocks
+    int header_blocks = (sizeof(StarHeader) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    for (int i = 0; i < header_blocks && i < info.total_blocks; i++)
+    {
+        info.block_status[i] = 1;
+        info.used_blocks++;
+    }
+
+    // Mark blocks used by files
+    for (int i = 0; i < header->file_count; i++)
+    {
+        int current_block = header->files[i].start_block;
+        while (current_block != -1 && current_block < info.total_blocks)
+        {
+            if (!info.block_status[current_block])
+            { // Only count if not already marked
+                info.block_status[current_block] = 1;
+                info.used_blocks++;
+            }
+
+            // Read next block
+            DataBlock block;
+            lseek(fd, current_block * BLOCK_SIZE, SEEK_SET);
+            if (read(fd, &block, sizeof(DataBlock)) != sizeof(DataBlock))
+            {
+                break;
+            }
+            current_block = block.next_block;
+        }
+    }
+
+    // Calculate free blocks
+    info.free_blocks = info.total_blocks - info.used_blocks;
+
+    // Analyze fragmentation
+    int current_free_chunk = 0;
+    info.fragmented_blocks = 0;
+    info.largest_free_chunk = 0;
+    info.smallest_free_chunk = info.total_blocks;
+
+    for (int i = 0; i < info.total_blocks; i++)
+    {
+        if (info.block_status[i] == 0)
+        {
+            current_free_chunk++;
+            if (i == info.total_blocks - 1 || info.block_status[i + 1] == 1)
+            {
+                if (current_free_chunk > 0)
+                {
+                    // Update largest/smallest chunks
+                    if (current_free_chunk > info.largest_free_chunk)
+                    {
+                        info.largest_free_chunk = current_free_chunk;
+                    }
+                    if (current_free_chunk < info.smallest_free_chunk)
+                    {
+                        info.smallest_free_chunk = current_free_chunk;
+                    }
+                    // Count single blocks as fragmented
+                    if (current_free_chunk == 1)
+                    {
+                        info.fragmented_blocks++;
+                    }
+                }
+                current_free_chunk = 0;
+            }
+        }
+    }
+
+    // If no free blocks were found, reset smallest_free_chunk
+    if (info.free_blocks == 0)
+    {
+        info.smallest_free_chunk = 0;
+    }
+
+    // Calculate fragmentation ratio
+    info.fragmentation_ratio = info.free_blocks > 0 ? (float)info.fragmented_blocks / info.free_blocks : 0;
+
+    return info;
+}
+
+void print_fragmentation_visualization(FragmentationInfo *info, StarHeader *header)
+{
+    if (!info || !info->block_status)
+    {
+        fprintf(stderr, "Error: Información de fragmentación no válida\n");
+        return;
+    }
+
+    printf("\nEstado de Fragmentación:\n");
+    printf("------------------------\n");
+
+    // Basic block info - now with validation
+    printf("Bloques totales: %d\n", info->total_blocks);
+    printf("Bloques usados:  %d (%.1f%%)\n",
+           info->used_blocks,
+           (float)info->used_blocks / info->total_blocks * 100);
+    printf("Bloques libres: %d\n", info->free_blocks);
+
+    // Block distribution
+    printf("\nDistribución de bloques:\n");
+    printf("H = Header | █ = Usado | ░ = Libre\n");
+
+    printf("Bloque:  ");
+    for (int i = 0; i < info->total_blocks; i++)
+    {
+        printf("%-2d ", i);
+    }
+    printf("\nEstado:  ");
+
+    int header_blocks = (sizeof(StarHeader) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    for (int i = 0; i < info->total_blocks; i++)
+    {
+        if (i < header_blocks)
+        {
+            printf("H  ");
+        }
+        else if (info->block_status[i])
+        {
+            printf("█  ");
+        }
+        else
+        {
+            printf("░  ");
+        }
+    }
+
+    printf("\n\nContenido:\n");
+    for (int i = 0; i < header->file_count; i++)
+    {
+        printf("- Bloque %d: %s (%lld bytes)\n",
+               header->files[i].start_block,
+               header->files[i].filename,
+               (long long)header->files[i].size);
+    }
+
+    if (info->fragmented_blocks > 0)
+    {
+        printf("\nFragmentación: %.1f%% (%d bloques)\n",
+               info->fragmentation_ratio * 100,
+               info->fragmented_blocks);
+    }
+}
+
 /*
  * Función para desfragmentar (empacar) el archivador
  * star_filename: Nombre del archivo de archivado
  */
 void pack_star(char *star_filename)
 {
-    // Abrir el archivo de archivado para lectura y escritura
     int fd = open(star_filename, O_RDWR);
     if (fd < 0)
     {
-        perror("Error al abrir el archivo empaquetado para lectura/escritura");
+        perror("Error al abrir el archivo empaquetado");
         exit(EXIT_FAILURE);
     }
 
-    // Leer el encabezado del archivador
-    StarHeader header;
-    read_header(fd, &header);
+    StarHeader orig_header;
+    read_header(fd, &orig_header);
 
-    // Recopilar todos los bloques utilizados y crear un mapeo de índices de bloques antiguos a nuevos
-    int block_mapping_capacity = 1000;
-    int block_mapping_count = 0;
-    BlockMapping *block_mappings = malloc(block_mapping_capacity * sizeof(BlockMapping));
-    if (!block_mappings)
+    // Análisis inicial
+    FragmentationInfo before_info = analyze_fragmentation(fd, &orig_header);
+    if (verbose_level >= 1)
     {
-        perror("Error al asignar memoria");
+        printf("\nAntes de desfragmentar:");
+        print_fragmentation_visualization(&before_info, &orig_header);
+    }
+
+    // Si no hay archivos, salir
+    if (orig_header.file_count == 0)
+    {
+        free(before_info.block_status);
+        close(fd);
+        return;
+    }
+
+    // Crear nueva estructura header
+    StarHeader new_header;
+    memcpy(&new_header, &orig_header, sizeof(StarHeader));
+    new_header.free_block_list = -1;
+
+    // Calcular bloques del header
+    int header_blocks = (sizeof(StarHeader) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Crear buffer temporal para almacenar todos los bloques de datos
+    DataBlock *data_blocks = malloc(orig_header.file_count * sizeof(DataBlock));
+    if (!data_blocks)
+    {
+        perror("Error de memoria");
+        free(before_info.block_status);
         close(fd);
         exit(EXIT_FAILURE);
     }
 
-    // Recorrer cada archivo y registrar sus bloques
-    for (int i = 0; i < header.file_count; i++)
+    // Primero, recopilar todos los bloques de datos en orden
+    int data_block_count = 0;
+    for (int i = 0; i < orig_header.file_count; i++)
     {
-        int current_block = header.files[i].start_block;
-        while (current_block != -1)
+        // Leer el bloque de datos del archivo
+        lseek(fd, orig_header.files[i].start_block * BLOCK_SIZE, SEEK_SET);
+        if (read(fd, &data_blocks[data_block_count], sizeof(DataBlock)) == sizeof(DataBlock))
         {
-            // Expandir el array de mapeo de bloques si es necesario
-            if (block_mapping_count >= block_mapping_capacity)
-            {
-                block_mapping_capacity *= 2;
-                block_mappings = realloc(block_mappings, block_mapping_capacity * sizeof(BlockMapping));
-                if (!block_mappings)
-                {
-                    perror("Error al asignar memoria");
-                    close(fd);
-                    exit(EXIT_FAILURE);
-                }
-            }
-            block_mappings[block_mapping_count].old_block = current_block;
-            block_mappings[block_mapping_count].new_block = -1;
-            block_mapping_count++;
-
-            // Leer el bloque de datos para obtener el índice del siguiente bloque
-            lseek(fd, current_block * BLOCK_SIZE, SEEK_SET);
-            DataBlock block;
-            read(fd, &block, sizeof(DataBlock));
-
-            current_block = block.next_block;
+            // Actualizar el header para el nuevo inicio de archivo
+            new_header.files[i].start_block = header_blocks + data_block_count;
+            data_block_count++;
         }
     }
 
-    // Ordenar los bloques en orden decreciente de índices old_block
-    qsort(block_mappings, block_mapping_count, sizeof(BlockMapping), compare_blocks);
+    // Segundo, escribir el nuevo header
+    lseek(fd, 0, SEEK_SET);
+    write_header(fd, &new_header);
 
-    // Asignar nuevos índices de bloque secuencialmente, comenzando después del encabezado
-    int new_block_index = (sizeof(StarHeader) + BLOCK_SIZE - 1) / BLOCK_SIZE; // Calcular número de bloques usados por el encabezado
-    for (int i = block_mapping_count - 1; i >= 0; i--)
+    // Tercero, escribir los bloques de datos de manera contigua
+    for (int i = 0; i < data_block_count; i++)
     {
-        block_mappings[i].new_block = new_block_index++;
-    }
+        // Actualizar el puntero al siguiente bloque
+        data_blocks[i].next_block = (i < data_block_count - 1) ? (header_blocks + i + 1) : -1;
 
-    // Mover bloques a sus nuevas posiciones y actualizar referencias
-    for (int i = 0; i < block_mapping_count; i++)
-    {
-        int old_block = block_mappings[i].old_block;
-        int new_block = block_mappings[i].new_block;
-
-        // Leer el bloque de la posición antigua
-        lseek(fd, old_block * BLOCK_SIZE, SEEK_SET);
-        DataBlock block;
-        read(fd, &block, sizeof(DataBlock));
-
-        // Actualizar next_block del bloque a los nuevos índices
-        if (block.next_block != -1)
+        // Escribir el bloque en su nueva posición
+        lseek(fd, (header_blocks + i) * BLOCK_SIZE, SEEK_SET);
+        if (write(fd, &data_blocks[i], sizeof(DataBlock)) != sizeof(DataBlock))
         {
-            // Encontrar el nuevo índice de bloque para block.next_block
-            for (int j = 0; j < block_mapping_count; j++)
-            {
-                if (block_mappings[j].old_block == block.next_block)
-                {
-                    block.next_block = block_mappings[j].new_block;
-                    break;
-                }
-            }
-        }
-
-        // Escribir el bloque en la nueva posición
-        lseek(fd, new_block * BLOCK_SIZE, SEEK_SET);
-        write(fd, &block, sizeof(DataBlock));
-    }
-
-    // Actualizar start_block de cada archivo en el encabezado a los nuevos índices
-    for (int i = 0; i < header.file_count; i++)
-    {
-        int old_start_block = header.files[i].start_block;
-        for (int j = 0; j < block_mapping_count; j++)
-        {
-            if (block_mappings[j].old_block == old_start_block)
-            {
-                header.files[i].start_block = block_mappings[j].new_block;
-                break;
-            }
+            perror("Error al escribir bloque");
+            free(data_blocks);
+            free(before_info.block_status);
+            close(fd);
+            exit(EXIT_FAILURE);
         }
     }
 
-    // No hay bloques libres después de la desfragmentación
-    header.free_block_list = -1;
+    // Truncar el archivo al nuevo tamaño
+    int total_blocks = header_blocks + data_block_count;
+    off_t new_size = total_blocks * BLOCK_SIZE;
+    if (ftruncate(fd, new_size) != 0)
+    {
+        perror("Error al truncar archivo");
+    }
 
-    // Escribir el encabezado actualizado de nuevo en el archivador
-    write_header(fd, &header);
+    // Análisis final
+    FragmentationInfo after_info = analyze_fragmentation(fd, &new_header);
+    if (verbose_level >= 1)
+    {
+        printf("\nDespués de desfragmentar:");
+        print_fragmentation_visualization(&after_info, &new_header);
 
-    // Truncar el archivo de archivado al nuevo tamaño
-    off_t new_size = new_block_index * BLOCK_SIZE;
-    ftruncate(fd, new_size); // Truncar el archivo al nuevo tamaño
+        int blocks_saved = before_info.total_blocks - after_info.total_blocks;
+        printf("\nResumen de optimización:\n");
+        printf("- Tamaño antes: %d bloques (%ld bytes)\n",
+               before_info.total_blocks, (long)before_info.total_blocks * BLOCK_SIZE);
+        printf("- Tamaño después: %d bloques (%ld bytes)\n",
+               after_info.total_blocks, (long)after_info.total_blocks * BLOCK_SIZE);
+        if (blocks_saved > 0)
+        {
+            printf("- Espacio recuperado: %d bloques (%ld bytes)\n",
+                   blocks_saved, (long)blocks_saved * BLOCK_SIZE);
+        }
+    }
 
+    // Limpieza
+    free(data_blocks);
+    free(before_info.block_status);
+    free(after_info.block_status);
     close(fd);
-    free(block_mappings);
-
-    if (verbose_level > 0)
-    {
-        printf("Archivo '%s' desfragmentado.\n", star_filename);
-    }
 }
 
 /*
